@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -98,6 +99,37 @@ class CLITests(unittest.TestCase):
             self.assertEqual(printer.main(), 1)
         deploy.assert_not_called()
         self.assertIn("Дождитесь", output.getvalue())
+
+    def test_server_does_not_install_or_configure_cups_on_host(self):
+        with patch.object(self.app, "preflight"), patch.object(self.app, "plugin"), \
+                patch.object(self.app, "usb", return_value=960), \
+                patch.object(self.app, "image", return_value="server-image") as image, \
+                patch.object(self.app, "start") as start, \
+                patch.object(self.app, "check_proxy"), patch.object(self.app, "compose"), \
+                patch.object(self.app, "devices", return_value=[]), \
+                patch.object(self.app, "host_queue", side_effect=AssertionError("host queue")), \
+                patch.object(self.app, "install_cups", side_effect=AssertionError("package installation")), \
+                patch.object(self.app, "host_run", side_effect=AssertionError("host CUPS")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.app.deploy(mode="server")
+        image.assert_called_once_with("server")
+        start.assert_called_once_with(960, "server-image", "server")
+
+    def test_correct_usb_setup_does_not_require_sudo_again(self):
+        node = Path(self.temp.name) / "usb"
+        node.touch()
+        node.chmod(0o660)
+        rule = Path(self.temp.name) / "rule"
+        rule.write_text('SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="03f0", '
+                        'ATTR{idProduct}=="002a", ATTR{serial}=="000000000Q8D61SNPR1a", GROUP="hpprinter", MODE="0660"\n')
+        def path(value):
+            return rule if str(value) == "/etc/udev/rules.d/99-hp-p1102.rules" else Path(value)
+        with patch.object(printer, "Path", side_effect=path), \
+                patch.object(printer.grp, "getgrnam", return_value=SimpleNamespace(gr_gid=node.stat().st_gid)), \
+                patch.object(self.app, "devices", return_value=[(Path(self.temp.name), node)]), \
+                patch.object(self.app, "root", side_effect=AssertionError("unnecessary sudo")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.app.usb(), node.stat().st_gid)
 
 
 if __name__ == "__main__":

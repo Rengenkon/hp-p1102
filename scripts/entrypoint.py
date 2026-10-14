@@ -6,12 +6,19 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, "/usr/local/lib/printer")
 from runtime import atomic_write, cups_files_config, device_uri, load_config, local_run, reconcile_queue, scheduler_running
 
 CONFIG = Path("/etc/printer/printer.toml")
+
+
+def proxy_check():
+    with urllib.request.urlopen("http://127.0.0.1:8631/health", timeout=3) as response:
+        if response.status != 200 or response.read() != b"OK\n":
+            raise RuntimeError("IPP-прокси не готов")
 
 
 def apply():
@@ -81,6 +88,8 @@ def main():
             raise RuntimeError("CUPS scheduler не работает")
         config = load_config(CONFIG)
         local_run(["lpstat", "-p", config["printer"]["name"]])
+        if os.environ.get("PRINTER_MODE", "local") == "server":
+            proxy_check()
         return
     if "--apply" in sys.argv:
         apply()
@@ -100,6 +109,8 @@ def main():
     Path("/run/dbus/pid").unlink(missing_ok=True)
     local_run(["dbus-uuidgen", "--ensure=/etc/machine-id"])
     desired = Path("/usr/local/share/printer/cupsd.conf").read_text()
+    if os.environ.get("PRINTER_MODE", "local") == "server":
+        desired = desired.replace("Listen 0.0.0.0:631", "Listen 127.0.0.1:631")
     cups_config = Path("/etc/cups/cupsd.conf")
     if not cups_config.exists() or cups_config.read_text() != desired:
         atomic_write(cups_config, desired, 0o640)
@@ -131,9 +142,11 @@ def main():
             time.sleep(0.5)
         if not stopping:
             apply()
+            if os.environ.get("PRINTER_MODE", "local") == "server":
+                children.append(subprocess.Popen(["/opt/proxy-venv/bin/python", "-u", "/usr/local/lib/printer/proxy.py"]))
         while not stopping:
             if any(c.poll() is not None for c in children):
-                raise RuntimeError("CUPS или D-Bus завершился неожиданно")
+                raise RuntimeError("CUPS, D-Bus или IPP-прокси завершился неожиданно")
             time.sleep(0.5)
     finally:
         stop(None, None)

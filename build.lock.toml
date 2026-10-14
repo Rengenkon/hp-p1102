@@ -15,6 +15,9 @@ usbutils = "1:018-2"
 ca-certificates = "20250419"
 python3 = "3.13.5-1"
 
+[server_packages]
+python3-venv = "3.13.5-1"
+
 [plugin]
 version = "3.22.10"
 url = "https://www.openprinting.org/download/printdriver/auxfiles/HP/plugins/hplip-3.22.10-plugin.run"

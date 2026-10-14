@@ -5,8 +5,9 @@ services:
     restart: unless-stopped
     environment:
       HP_PRINTER_GID: ${HP_PRINTER_GID:?Run python3 scripts/printer.py deploy}
+      PRINTER_MODE: ${PRINTER_MODE:-local}
     ports:
-      - '127.0.0.1:${PRINTER_PORT:-8631}:631'
+      - '${PRINTER_BIND:-127.0.0.1}:${PRINTER_PORT:-8631}:${PRINTER_CONTAINER_PORT:-631}'
     volumes:
       - cups-config:/etc/cups
       - cups-spool:/var/spool/cups

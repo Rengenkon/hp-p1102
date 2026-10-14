@@ -13,6 +13,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ if sys.version_info < (3, 11):
 
 import tomllib
 from runtime import atomic_write, ipp_uri, load_config, reconcile_queue, scheduler_running
+from ipp import attributes, decode_prefix, printer_attributes_request
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / ".state"
@@ -59,6 +61,19 @@ class App:
             raise ValueError("Версии пакетов в lock-файле должны быть строками; имена с точками заключайте в кавычки")
         self.env = {**os.environ, "LC_ALL": "C"}
         self.arch = None
+
+    def deployed_mode(self):
+        path = STATE / "compose.env"
+        if path.exists():
+            for line in path.read_text().splitlines():
+                if line.startswith("PRINTER_MODE="):
+                    return line.split("=", 1)[1]
+        return "local"
+
+    def public_uri(self):
+        if self.deployed_mode() == "server":
+            return f"ipp://localhost:{self.config['container']['host_port']}/"
+        return ipp_uri(self.config)
 
     def say(self, message):
         print(message, flush=True)
@@ -155,7 +170,8 @@ class App:
     def compose(self, args, **kwargs):
         if not (STATE / "compose.env").exists():
             raise Failure("Развертывание еще не подготовлено.", "Выполните python3 scripts/printer.py deploy.")
-        env = {key: value for key, value in self.env.items() if key not in ("HP_PRINTER_GID", "PRINTER_IMAGE", "PRINTER_PORT")}
+        env = {key: value for key, value in self.env.items() if key not in (
+            "HP_PRINTER_GID", "PRINTER_IMAGE", "PRINTER_PORT", "PRINTER_MODE", "PRINTER_BIND", "PRINTER_CONTAINER_PORT")}
         return self.run(["docker", "compose", "--env-file", STATE / "compose.env", "-f", ROOT / "compose.yaml", *args], env=env, **kwargs)
 
     def preflight(self):
@@ -227,6 +243,7 @@ class App:
     def usb(self):
         host, p = self.config["host"], self.config["printer"]
         group = host["usb_group"]
+        created = False
         self.say("  Настройка группы и правила USB при необходимости использует sudo.")
         try:
             gid = grp.getgrnam(group).gr_gid
@@ -239,6 +256,7 @@ class App:
             else:
                 raise Failure("Не найдена команда создания групп.", f"Создайте системную группу {group} и повторите запуск.")
             gid = grp.getgrnam(group).gr_gid
+            created = True
             self.say(f"  CHANGE Создана группа {group}, GID={gid}")
         # Escape udev strings; arbitrary serial values must never inject rules.
         serial = p["serial"]
@@ -257,8 +275,11 @@ class App:
             self.say("  CHANGE Правило udev установлено")
         else:
             self.say("  SKIP Правило udev соответствует конфигурации")
-        self.root(["udevadm", "control", "--reload-rules"])
         devices = self.devices()
+        needs_reload = changed or created or any(
+            node.stat().st_gid != gid or stat.S_IMODE(node.stat().st_mode) != 0o660 for _, node in devices)
+        if needs_reload:
+            self.root(["udevadm", "control", "--reload-rules"])
         for entry, node in devices:
             metadata = node.stat()
             if changed or metadata.st_gid != gid or stat.S_IMODE(metadata.st_mode) != 0o660:
@@ -274,23 +295,27 @@ class App:
             self.say("  WARN Принтер не подключен. Настройка продолжится; проверка USB и физическая печать отложены.")
         return gid
 
-    def image(self):
+    def image(self, mode="local"):
         inputs = [ROOT / name for name in ("Dockerfile", "build.lock.toml", "scripts/runtime.py", "scripts/entrypoint.py", "config/cupsd.conf")]
+        if mode == "server":
+            inputs += [ROOT / name for name in ("requirements-proxy.lock", "scripts/ipp.py", "scripts/proxy.py", "config/test-print.test")]
         digest = hashlib.sha256()
-        digest.update(self.arch.encode())
+        digest.update(f"{self.arch}:{mode}".encode())
         for path in inputs:
             digest.update(path.relative_to(ROOT).as_posix().encode() + b"\0" + path.read_bytes())
-        tag = f"local/hplip-p1102:{digest.hexdigest()[:20]}"
+        tag = f"local/hplip-p1102:{mode}-{digest.hexdigest()[:20]}"
         if self.run(["docker", "image", "inspect", tag], check=False).returncode == 0:
             self.say(f"  SKIP Образ {tag} уже собран")
             return tag
         lock = self.lock
-        args = ["docker", "build", "--platform", f"linux/{self.arch}", "-t", tag]
+        args = ["docker", "build", "--target", mode, "--platform", f"linux/{self.arch}", "-t", tag]
         build_args = {
             "BASE_IMAGE": lock["build"]["base_image"], "DEBIAN_SNAPSHOT": lock["build"]["snapshot"],
             "APT_PACKAGES": " ".join(f"{k}={v}" for k, v in lock["packages"].items()),
             "PLUGIN_VERSION": lock["plugin"]["version"], "PLUGIN_SHA256": lock["plugin"]["sha256"],
         }
+        if mode == "server":
+            build_args["SERVER_APT_PACKAGES"] = " ".join(f"{k}={v}" for k, v in lock["server_packages"].items())
         for key, value in build_args.items():
             args += ["--build-arg", f"{key}={value}"]
         self.say("  CHANGE Сборка закрепленного образа; вывод Docker следует ниже")
@@ -298,14 +323,16 @@ class App:
         self.say(f"  OK   Образ {tag} собран")
         return tag
 
-    def start(self, gid, image):
+    def start(self, gid, image, mode="local"):
         # Mount a directory: editors/atomic writes can replace the file inode.
         # A single-file bind mount would keep showing the obsolete configuration.
         runtime_config = STATE / "runtime" / "printer.toml"
         desired = (ROOT / "printer.toml").read_text()
         if not runtime_config.exists() or runtime_config.read_text() != desired:
             atomic_write(runtime_config, desired)
-        content = f"HP_PRINTER_GID={gid}\nPRINTER_IMAGE={image}\nPRINTER_PORT={self.config['container']['host_port']}\n"
+        content = (f"HP_PRINTER_GID={gid}\nPRINTER_IMAGE={image}\nPRINTER_PORT={self.config['container']['host_port']}\n"
+                   f"PRINTER_MODE={mode}\nPRINTER_BIND={'0.0.0.0' if mode == 'server' else '127.0.0.1'}\n"
+                   f"PRINTER_CONTAINER_PORT={8631 if mode == 'server' else 631}\n")
         envfile = STATE / "compose.env"
         if not envfile.exists() or envfile.read_text() != content:
             atomic_write(envfile, content)
@@ -323,6 +350,25 @@ class App:
                 self.say(f"  Не удалось получить журнал: {log_error}")
             raise
         self.say("  OK   Контейнер работает, CUPS и управляемая очередь готовы")
+
+    def check_proxy(self):
+        uri = self.public_uri()
+        request = urllib.request.Request(uri.replace("ipp://", "http://", 1),
+                                         data=printer_attributes_request(uri),
+                                         headers={"Content-Type": "application/ipp"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                header, records = decode_prefix(response.read())
+            if struct.unpack_from(">H", header, 2)[0] >= 0x0400:
+                raise ValueError("Get-Printer-Attributes отклонен")
+            uris = [record.value.decode() for name, record, depth in attributes(records)
+                    if not depth and name == b"printer-uri-supported"]
+            if uri not in uris:
+                raise ValueError(f"Прокси вернул неверные адреса принтера: {uris}")
+        except (OSError, ValueError) as error:
+            raise Failure(f"IPP-прокси не готов: {error}",
+                          "Проверьте журнал контейнера через doctor и повторите server.") from error
+        self.say(f"  OK   Корневой IPP-адрес отвечает: {uri}")
 
     def install_cups(self):
         managers = [
@@ -398,26 +444,32 @@ class App:
         self.host_run(["lpstat", "-v", name])
         self.say(f"  OK   Принтер {name} подключен на хосте")
 
-    def deploy(self):
+    def deploy(self, mode="local"):
+        self.say(f"Режим: {'server — сетевой IPP на 0.0.0.0' if mode == 'server' else 'local — локальная печать'}")
         operations = [("Проверка хоста", self.preflight), ("Проверка HP-плагина", self.plugin),
-                      ("Настройка USB", self.usb), ("Подготовка образа", self.image)]
+                      ("Настройка USB", self.usb), ("Подготовка образа", lambda: self.image(mode))]
         results = []
         for number, (title, operation) in enumerate(operations, 1):
             self.step(number, title)
             results.append(operation())
             self.completed.append(title)
         self.step(5, "Запуск контейнера")
-        self.start(results[2], results[3])
+        self.start(results[2], results[3], mode)
         self.completed.append(self.stage)
-        self.step(6, "Настройка принтера на хосте")
-        self.host_queue()
+        self.step(6, "Проверка IPP-прокси" if mode == "server" else "Настройка принтера на хосте")
+        if mode == "server":
+            self.check_proxy()
+        else:
+            self.host_queue()
         self.completed.append(self.stage)
         self.step(7, "Итоговая проверка")
         self.compose(["exec", "-T", "hplip", "python3", "/usr/local/bin/entrypoint.py", "--check"])
         nodes = [str(node) for _, node in self.devices()]
         self.compose(["exec", "-T", "hplip", "python3", "/usr/local/bin/entrypoint.py", "--usb-check", *nodes], stream=True)
-        self.host_run(["lpstat", "-p", self.config["host"]["queue"]])
-        self.say(f"  OK   Развертывание завершено. IPP: {ipp_uri(self.config)}")
+        if mode == "local":
+            self.host_run(["lpstat", "-p", self.config["host"]["queue"]])
+        address = f"ipp://<адрес-сервера>:{self.config['container']['host_port']}/" if mode == "server" else ipp_uri(self.config)
+        self.say(f"  OK   Развертывание завершено. IPP: {address}")
         if not self.devices():
             self.say("  WARN USB-принтер отсутствует: физическая печать пока не проверена.")
         self.say("Пробная печать: python3 scripts/printer.py test-print")
@@ -452,8 +504,14 @@ class App:
                     problems.append(f"{title}: проверка завершилась ошибкой")
             except Failure as error:
                 problems.append(str(error))
-        self.say("\nCUPS хоста:")
-        if shutil.which("lpstat"):
+        if self.deployed_mode() == "server":
+            self.say("\nIPP-прокси:")
+            try:
+                self.check_proxy()
+            except Failure as error:
+                problems.append(str(error))
+        elif shutil.which("lpstat"):
+            self.say("\nCUPS хоста:")
             result = self.run(["lpstat", "-h", "/run/cups/cups.sock", "-v", self.config["host"]["queue"]], check=False)
             self.say((result.stdout + result.stderr).strip())
             if result.returncode:
@@ -475,6 +533,12 @@ class App:
             raise Failure("Принтер не подключен.", "Подключите и включите принтер, затем повторите test-print.")
         sample = STATE / "test-print.txt"
         atomic_write(sample, f"HP LaserJet P1102 — test print\n{datetime.now().isoformat()}\nConfiguration as code\n")
+        if self.deployed_mode() == "server":
+            self.say("Отправка одной тестовой страницы через корневой IPP-адрес сервера.")
+            self.compose(["exec", "-T", "hplip", "ipptool", "-tv", "-f", "/etc/hosts", "ipp://localhost:8631/",
+                          "/usr/local/share/printer/test-print.test"], stream=True)
+            self.say("OK Задание принято. Подтвердите выход страницы; при проблемах выполните doctor.")
+            return
         self.say("Отправка одной тестовой страницы через очередь хоста.")
         result = self.run(["lp", "-d", self.config["host"]["queue"], sample],
                           env={**self.env, "CUPS_SERVER": "/run/cups/cups.sock"})
@@ -484,7 +548,7 @@ class App:
 
 def main():
     parser = argparse.ArgumentParser(description="Развертывание и диагностика HP P1102. Python stdlib, без внешних зависимостей.")
-    parser.add_argument("command", choices=("deploy", "status", "doctor", "test-print"))
+    parser.add_argument("command", choices=("deploy", "server", "status", "doctor", "test-print"))
     parser.add_argument("--verbose", action="store_true", help="показывать команды и traceback")
     args = parser.parse_args()
     app = None
@@ -497,8 +561,8 @@ def main():
         except BlockingIOError:
             raise Failure("Другая команда уже работает с этим репозиторием.", "Дождитесь ее завершения и повторите запуск.")
         app = App(args.verbose)
-        if args.command == "deploy":
-            app.deploy()
+        if args.command in ("deploy", "server"):
+            app.deploy(mode="server" if args.command == "server" else "local")
         elif args.command == "test-print":
             app.test_print()
         else:

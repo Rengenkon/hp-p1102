@@ -1,5 +1,5 @@
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS common
 
 ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8
 ARG DEBIAN_SNAPSHOT
@@ -31,3 +31,18 @@ RUN sed -i -E 's|^#?ErrorLog .*|ErrorLog /dev/stderr|; s|^#?AccessLog .*|AccessL
     cp /etc/cups/cups-files.conf /usr/local/share/printer/cups-files.conf
 EXPOSE 631
 ENTRYPOINT ["python3", "-u", "/usr/local/bin/entrypoint.py"]
+
+FROM common AS local
+ENV PRINTER_MODE=local
+
+FROM common AS server
+ARG SERVER_APT_PACKAGES
+RUN apt-get update && apt-get install -y --no-install-recommends $SERVER_APT_PACKAGES && \
+    rm -rf /var/lib/apt/lists/* && python3 -m venv /opt/proxy-venv
+COPY requirements-proxy.lock /usr/local/share/printer/requirements-proxy.lock
+RUN /opt/proxy-venv/bin/python -m pip install --no-cache-dir --require-hashes \
+    -r /usr/local/share/printer/requirements-proxy.lock && /opt/proxy-venv/bin/python -m pip check
+COPY scripts/ipp.py scripts/proxy.py /usr/local/lib/printer/
+COPY config/test-print.test /usr/local/share/printer/test-print.test
+ENV PRINTER_MODE=server
+EXPOSE 8631

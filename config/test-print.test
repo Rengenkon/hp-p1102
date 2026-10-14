@@ -1,0 +1,15 @@
+{
+  NAME "Print one test page through the public IPP endpoint"
+  OPERATION Print-Job
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR naturalLanguage attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR name requesting-user-name $user
+  ATTR name job-name "Server test print"
+  ATTR mimeMediaType document-format text/plain
+  FILE $filename
+  STATUS successful-ok
+  EXPECT job-id OF-TYPE integer
+  EXPECT job-uri OF-TYPE uri
+}
