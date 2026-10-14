@@ -1,0 +1,21 @@
+# Update deliberately, then build and test-print. All apt dependencies use this snapshot.
+[build]
+base_image = "debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f"
+snapshot = "20261001T000000Z"
+architectures = ["amd64", "arm64"]
+
+[packages]
+cups = "2.4.10-3+deb13u2"
+cups-client = "2.4.10-3+deb13u2"
+hplip = "3.22.10+dfsg0-8.1+deb13u1"
+printer-driver-hpcups = "3.22.10+dfsg0-8.1+deb13u1"
+dbus = "1.16.2-2"
+"libusb-1.0-0" = "2:1.0.28-1"
+usbutils = "1:018-2"
+ca-certificates = "20250419"
+python3 = "3.13.5-1"
+
+[plugin]
+version = "3.22.10"
+url = "https://www.openprinting.org/download/printdriver/auxfiles/HP/plugins/hplip-3.22.10-plugin.run"
+sha256 = "bb9648ea0626a9b3cfa29e260348d5d617f328c55b66eda346384c04f4740b1f"

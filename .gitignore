@@ -2,3 +2,6 @@
 plugins/*.run
 plugins/*.asc
 *.log
+.state/
+.venv/
+__pycache__/

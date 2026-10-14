@@ -1,0 +1,19 @@
+[printer]
+name = "HP_LaserJet_Professional_P1102"
+vendor_id = "03f0"
+product_id = "002a"
+serial = "000000000Q8D61SNPR1a"
+device_model = "HP_LaserJet_Professional_P1102"
+driver = "drv:///hpcups.drv/hp-laserjet_professional_p1102.ppd"
+
+[printer.options]
+PageSize = "A4"
+
+[container]
+host_port = 8631
+
+[host]
+queue = "HP_LaserJet_Professional_P1102"
+make_default = true
+install_cups = true
+usb_group = "hpprinter"

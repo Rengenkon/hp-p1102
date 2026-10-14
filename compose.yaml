@@ -1,25 +1,27 @@
+name: hp-docker
 services:
   hplip:
-    build:
-      context: .
-      args:
-        HP_PRINTER_GID: ${HP_PRINTER_GID:?Run ./scripts/setup-host.sh first}
-    image: local/hplip-p1102:3.22.10
+    image: ${PRINTER_IMAGE:?Run python3 scripts/printer.py deploy}
     restart: unless-stopped
     environment:
-      PRINTER_NAME: HP_LaserJet_Professional_P1102
-      PRINTER_URI: 'hp:/usb/HP_LaserJet_Professional_P1102?serial=000000000Q8D61SNPR1a'
-      PRINTER_MODEL: 'drv:///hpcups.drv/hp-laserjet_professional_p1102.ppd'
+      HP_PRINTER_GID: ${HP_PRINTER_GID:?Run python3 scripts/printer.py deploy}
     ports:
-      - '127.0.0.1:8631:631'
+      - '127.0.0.1:${PRINTER_PORT:-8631}:631'
     volumes:
       - cups-config:/etc/cups
       - cups-spool:/var/spool/cups
       - /dev/bus/usb:/dev/bus/usb
+      - ./.state/runtime:/etc/printer:ro
     device_cgroup_rules:
       - 'c 189:* rw'
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "/usr/local/bin/entrypoint.py", "--check"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
 
 volumes:
   cups-config:

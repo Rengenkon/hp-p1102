@@ -1,110 +1,164 @@
-# HP LaserJet P1102 — reproducible Docker setup
+# HP LaserJet P1102: конфигурация как код
 
-This repository captures the working configuration established on **2026-10-14**:
+Переносимая конфигурация **конкретного USB-принтера** HP LaserJet Professional
+P1102 (`03f0:002a`, serial `000000000Q8D61SNPR1a`). CUPS, HPLIP и HP-плагин
+работают в закрепленном Docker-образе. На хосте автоматически настраиваются
+USB-права и IPP-очередь для печати из приложений.
 
-- Printer: HP LaserJet Professional P1102, USB `03f0:002a`.
-- Host OS in the original debugging session: Arch Linux; container: Debian 13 (Trixie).
-- HPLIP: `3.22.10`; required proprietary HP plugin: `3.22.10`.
-- CUPS queue: `HP_LaserJet_Professional_P1102`.
-- Device URI: `hp:/usb/HP_LaserJet_Professional_P1102?serial=000000000Q8D61SNPR1a`.
-- PPD: `drv:///hpcups.drv/hp-laserjet_professional_p1102.ppd`.
+## Развертывание
 
-**Root cause of printing failure:** CUPS accepted jobs and completed rendering, but HPLIP's backend logged `open device failed stat=12` every 30 seconds. The printer was visible via `lsusb` and `hp-info`, but printing only started after granting read/write access to the USB device. Therefore access control is essential, not optional.
+На Linux-хосте принтера заранее нужны:
 
-## New host / after reinstall
-
-Requirements: Linux with udev, Docker Engine (rootful), Docker Compose v2 plugin, `sudo`, `lsusb` (optional for diagnosis). Rootless Docker is not covered by this setup.
-
-1. Clone/copy this directory to the new system.
-2. **Locally** obtain the matching files and put them in `plugins/`:
-   - `hplip-3.22.10-plugin.run`
-   - `hplip-3.22.10-plugin.run.asc`
-
-   HP's endpoint returned **HTTP 403** in the debugging session. An alternate source is:
-   `https://www.openprinting.org/download/printdriver/auxfiles/HP/plugins/`
-
-   Check the authenticity of these files using an independently trusted signing key. The build uses HPLIP's own plugin installer, but do not treat downloading an `.asc` from the same server as independent trust verification. The HP license must be reviewed/accepted before running the automated installation. Keep the proprietary files out of public Git repositories; `.gitignore` excludes them.
-
-3. Set up host USB group + udev rule:
-
-   ```bash
-   ./scripts/setup-host.sh
-   ```
-
-   This creates `hpprinter` (only if absent), records **its actual GID** in `.env` for Docker build, and installs `/etc/udev/rules.d/99-hp-p1102.rules`.
-
-4. Disconnect/reconnect the printer (or power-cycle), then find its **current** bus/device number:
-
-   ```bash
-   lsusb -d 03f0:002a
-   # e.g. Bus 001 Device 016, so:
-   ls -l /dev/bus/usb/001/016
-   ```
-
-   Expected mode/group: `crw-rw---- root hpprinter`. The `/001/016` number is illustrative and **will change** after USB re-enumeration.
-
-5. Build/start:
-
-   ```bash
-   docker compose up -d --build
-   docker compose logs -f hplip
-   ```
-
-   `Dockerfile` checks for the expected HPLIP version. If Debian updates to a different upstream HPLIP version, the build **fails on purpose** rather than silently mixing a new HPLIP with an old plugin. Pin the Debian base/packages for long-term reproducibility if you maintain this for years.
-
-6. Verify and print:
-
-   ```bash
-   docker compose exec hplip lpstat -t
-   docker compose exec hplip hp-info -i
-   docker compose exec hplip lp -d HP_LaserJet_Professional_P1102 /etc/hosts
-   ```
-
-7. For graphical applications on the **host**, configure a printer using IPP URL:
-
-   `ipp://localhost:8631/printers/HP_LaserJet_Professional_P1102`
-
-   Docker exposes CUPS on **host loopback only**. The host may still need a print client / CUPS or compatible IPP stack, but **not HPLIP**. If connecting from another computer, you must deliberately configure access and authentication; do not just expose port 631 publicly.
-
-## How it works
-
-- `udev/99-hp-p1102.rules`: sets the P1102 USB node to `root:hpprinter`, mode `0660`. No world-write permission.
-- `scripts/setup-host.sh`: creates the host group, writes its numeric ID into `.env`, and installs the udev rule.
-- `Dockerfile`: packages CUPS, HPLIP, hpcups PPD driver, matching HP plugin, system D-Bus, and adds the container's `lp` account to the **same numeric GID**.
-- `compose.yaml`: mounts the USB bus (to survive hotplug/changed device numbers) and allows USB character device major 189 in the cgroup. No `privileged: true`.
-- `scripts/entrypoint.sh`: starts D-Bus and CUPS, creates the queue only if absent (idempotently), enables it, sets it as default.
-- Docker named volumes persist CUPS settings and spool between container recreations. The plugin is baked into the **image**, not hidden in a volatile writable container layer.
-
-**Security limitation:** The container sees `/dev/bus/usb` and its cgroup rule permits major 189, i.e. other USB devices too. Ordinary DAC permissions still apply, but it is not device-level isolation. On a shared/high-trust system you may want stricter per-device mediation. `group_add` alone is not sufficient to guarantee permissions of a CUPS backend; the Dockerfile explicitly adds `lp` to the host-matching group.
-
-## Recovery / useful commands
+- Python **3.11+**;
+- локальный **rootful Docker Engine** с доступом текущего пользователя к daemon;
+- Docker Compose с поддержкой `up --wait` (v2.20+ или новее);
+- udev/eudev, Unix-инструменты `install`, `mv`, `sha256sum`, создание групп;
+- `sudo` для настройки хоста, если команда запускается не от root.
 
 ```bash
-./scripts/diagnose.sh
-
-docker compose logs --tail=100 hplip
-docker compose exec hplip lpstat -t
-docker compose exec hplip hp-check -r
-
-docker compose exec hplip cupsctl --debug-logging
-docker compose exec hplip tail -n 100 /var/log/cups/error_log
+python3 scripts/printer.py deploy
 ```
 
-- **Jobs queued but no paper:** look for `open device failed stat=12` and check that the host USB node is `root:hpprinter` `0660`, then compare `id lp` inside the container against `.env`'s GID. This was the actual fix in the initial debugging session.
-- **Printer changed `/001/009` to `/001/016`:** normal; never hardcode bus/device numbers.
-- **`hp-setup` D-Bus traceback:** the first manual setup added a valid CUPS queue, then tried to notify the nonexistent system bus. This repo starts D-Bus and uses `lpadmin` directly; interactive `hp-setup` is not needed.
-- **HPLIP `hp-check` says 21 missing dependencies:** its 3.22.10 Debian 13 detection is outdated. Diagnose actual printing; do not add all development/GUI libraries blindly.
-- **Plugin says network unavailable / HP HTTP 403:** supply the two plugin files locally. Check exact version.
-- **Printer USB ID changed:** the udev rule matches `03f0:002a` independently of bus and device numbers.
-- **No default printer in host applications:** add the IPP URL above to host printer settings. Container queue does not automatically register itself on every host.
+Команда проверяет хост, проверяет/скачивает плагин, настраивает USB, собирает
+образ, запускает контейнер, настраивает CUPS хоста и регистрирует принтер.
+Операции с правами администратора предварительно обозначаются в выводе.
+HP-плагин — проприетарное ПО; запуск развертывания предполагает принятие его
+лицензии. Архив устанавливается встроенным HP-инсталлятором после проверки
+закрепленного SHA-256, без сетевых запросов `hp-plugin` к изменяемым keyserver/CDN.
 
-### Backups
+Скрипты используют **только стандартную библиотеку Python**. Если появятся
+сторонние зависимости, они должны устанавливаться в `.venv` с закрепленными
+версиями, а не в системный Python.
 
-The two named volumes hold the CUPS queue/settings and spool. A new host can recreate the queue automatically from the entrypoint, so volume restoration is **not required** for this specific printer. If you customized CUPS settings, back up the volumes before reinstalling. **Do not use `docker compose down -v` unless you intend to erase the saved settings/spool.**
+## Что находится в Git
 
-### Important caveats
+- `printer.toml`: идентификаторы устройства, очередь, параметры печати, порт,
+  настройки хоста. Для печати по умолчанию задан A4.
+- `build.lock.toml`: digest базового образа, snapshot Debian, точные версии
+  прямых пакетов, версия/URL/SHA-256 HP-плагина.
+- `config/cupsd.conf`: настройки сервера контейнера.
+- `Dockerfile`, `compose.yaml`, Python-скрипты.
 
-- The provided Dockerfile has **not been executed against your physical printer or built in this sandbox**; it is based on the successful manual configuration and official package behavior. The one part to verify on the first build is unattended license/plugin installation (`printf 'y\n' | hp-plugin -i -p ...`). If that installer fails, review its output and install in an interactive container, then adjust the Docker build rather than blindly bypassing signature checks.
-- The USB permissions change has been tested in the conversation only with a temporary `chmod 666`; the narrower `udev` + `hpprinter` group policy still needs one test print after reconnecting the printer.
-- If the printer is replaced by a different unit, update `PRINTER_URI` to its new serial. The queue is only created if absent, so either edit the existing queue with `lpadmin -v` or remove it first after backing up settings.
-- Some host-level USB services (`ipp-usb`, `usblp`) can compete for the device. Investigate only if logs suggest a conflict; do not disable services preemptively.
+GID хоста вычисляется при развертывании и передается **при запуске**, не при
+сборке. Изменение GID не требует пересборки образа. `.state/`, `.venv`,
+локальные плагины и логи не коммитятся.
+
+При deploy создается runtime-копия `printer.toml` в `.state/runtime/`. В контейнер
+монтируется каталог: атомарное сохранение файла не оставляет устаревший inode,
+и изменения применяются без обязательного пересоздания контейнера.
+
+Имя Compose-проекта закреплено как `hp-docker`, чтобы использовать существующие
+тома `hp-docker_cups-config` и `hp-docker_cups-spool` при переходе с наброска.
+Первый deploy заменит старый контейнер этого сервиса, сохранив эти тома.
+
+## Повторный запуск и восстановление
+
+Повторите ту же команду после изменения конфигурации или неисправности:
+
+```bash
+python3 scripts/printer.py deploy
+```
+
+- существующая группа используется с ее фактическим GID;
+- правило udev обновляется только при отличии; применяется и проверяется для
+  конкретного устройства, без фиксированных bus/device номеров;
+- правильный плагин не скачивается повторно; неверный файл не исполняется;
+- образ определяется хешем входов сборки и архитектуры; готовый образ используется;
+- Compose сохраняет неизменный работающий контейнер и запускает остановленный;
+- управляемые очереди сверяются с URI, драйвером и параметрами; очередь и задания
+  не удаляются для применения изменений;
+- поврежденный/измененный PPD восстанавливается; отсутствующая очередь создается;
+- отключенная управляемая очередь включается. Если она снова останавливается,
+  исследуйте ошибку через `doctor`, а не повторяйте перезапуск;
+- предыдущие управляемые параметры, удаленные из TOML, снимаются; прочие параметры
+  и очереди сохраняются;
+- параллельные команды из одного репозитория блокируются.
+
+Обновление образа/параметров запуска может потребовать пересоздания контейнера.
+Настройки очереди и задания находятся в именованных томах. При старте серверные
+конфиги восстанавливаются из образа, а очередь приводится к TOML: том не является
+альтернативным источником управляемых настроек. Не используйте `down -v`, если
+не намерены удалить настройки и задания.
+
+## Настройка разных Linux-хостов
+
+Название дистрибутива не используется для выбора поведения. Проверяются
+доступные инструменты. Если CUPS отсутствует и `host.install_cups = true`,
+поддерживаются установка через `apt-get`, `dnf`, `pacman`, `zypper`, `apk`,
+`xbps-install` и запуск через systemd, OpenRC или runit (Void).
+
+На остальных системах заранее установите и запустите CUPS/cups-client. Docker
+скрипт не устанавливает. Хосту не нужны HPLIP и HP-плагин.
+
+Не все Linux-системы используют udev и не все CPU поддерживаются HP-плагином.
+Для неизвестного механизма USB/инициализации выводится конкретная инструкция.
+Закреплены архитектуры `amd64`, `arm64`; реальные проверки сборки описаны ниже.
+Для SELinux/AppArmor-хостов проверьте локальные запреты, если корректных Unix-прав
+недостаточно: скрипт не отключает политики безопасности автоматически.
+
+На хосте создается очередь с драйвером CUPS `everywhere` к IPP-серверу контейнера:
+
+```text
+ipp://localhost:8631/printers/HP_LaserJet_Professional_P1102
+```
+
+Порт контейнера публикуется только на loopback. Не меняйте адрес на публичный
+без отдельной настройки доступа. Контейнер видит USB-шину целиком, cgroup разрешает
+major 189; Unix-права ограничивают доступ, но это не изоляция одного USB-устройства.
+
+## Проверка и ошибки
+
+```bash
+python3 scripts/printer.py status
+python3 scripts/printer.py doctor
+python3 scripts/printer.py test-print
+python3 scripts/printer.py deploy --verbose
+```
+
+`status`/`doctor` не меняют системные настройки. `test-print` явно отправляет одну
+страницу через очередь хоста; принятие задания не означает подтверждение выхода
+бумаги. Развертывание само ничего не печатает. Без подключенного устройства
+настройка разрешена с предупреждением об отложенной физической проверке.
+
+Каждый этап обозначается номером, действия — `OK`, `SKIP`, `CHANGE`, `FIX`, `WARN`.
+Ошибка содержит этап, вывод неудачной команды, выполненные этапы и дальнейшие
+действия. Подробные логи — `.state/logs/`; traceback показывается с `--verbose`.
+Операции имеют тайм-ауты. Код завершения: `0` — успех, ненулевой — ошибка.
+
+Основная ранее обнаруженная проблема: `open device failed stat=12`. Проверьте
+режим `0660`, группу USB и `id lp` контейнера через `doctor`. После переподключения
+путь `/dev/bus/usb/BBB/DDD` меняется — это нормально.
+
+Для прямого доступа к Compose используется автоматически созданный env-файл:
+
+```bash
+docker compose --env-file .state/compose.env logs --tail=100 hplip
+```
+
+## Воспроизводимость и обновления
+
+Базовый образ закреплен digest, apt использует snapshot `20261001T000000Z`:
+состояние транзитивных зависимостей также фиксировано. HPLIP/плагин — `3.22.10`.
+Обновление выполняется явным изменением `build.lock.toml`, после чего нужны новая
+сборка и пробная печать. Наличие сетевых серверов не гарантируется фиксацией
+версий: для автономного восстановления сохраните архив плагина и готовый образ
+через `docker image save` (включая используемый локальный тег).
+
+Тесты логики восстановления без root/USB:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Интеграционная проверка готового образа (временные контейнеры без USB и без
+заданий печати, отдельный CUPS имитирует хост):
+
+```bash
+python3 tests/smoke_container.py local/hplip-p1102:<тег-из-вывода-сборки>
+```
+
+Проверяются запуск, повторное применение, восстановление URI/параметров,
+атомарная замена конфигурации, реальное IPP-подключение с `everywhere` и SIGTERM.
+Сборка и эта проверка выполнены на `amd64`; `arm64` и пакетные/сервисные адаптеры
+других дистрибутивов требуют проверки на соответствующих хостах. Физическую
+печать нужно подтвердить отдельно после настройки USB и CUPS хоста.

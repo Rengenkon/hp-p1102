@@ -1,8 +1,11 @@
-Place BOTH private, matching HPLIP plugin files here:
+# Локальный кэш HP-плагина
 
-- hplip-3.22.10-plugin.run
-- hplip-3.22.10-plugin.run.asc
+`deploy` скачивает `hplip-3.22.10-plugin.run`, если он отсутствует, и проверяет
+SHA-256 из `build.lock.toml` перед сборкой. Можно заранее положить файл сюда для
+развертывания без скачивания. Не совпавший по хешу файл не перезаписывается и не
+исполняется: команда завершается с объяснением.
 
-The image intentionally does not fetch files from HP's CDN (which returned HTTP 403).
-Get them from HP or the OpenPrinting mirror; validate the signature with a trusted HP signing key.
-Do not publicly redistribute the HP binary or publish the built image without checking its license.
+Версия плагина должна совпадать с upstream-версией HPLIP. При обновлении проверьте
+происхождение архива и подпись с доверенным HP-ключом до закрепления нового хеша.
+Плагин проприетарный; перед установкой ознакомьтесь с лицензией HP в архиве.
+Бинарные файлы исключены из Git.
