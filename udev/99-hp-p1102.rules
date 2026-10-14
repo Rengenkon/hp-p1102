@@ -1,0 +1,2 @@
+# HP LaserJet P1102 03f0:002a. Never grant generic USB access to all users.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="03f0", ATTR{idProduct}=="002a", GROUP="hpprinter", MODE="0660"

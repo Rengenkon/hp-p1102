@@ -1,0 +1,4 @@
+.env
+plugins/*.run
+plugins/*.asc
+*.log

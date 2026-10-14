@@ -1,0 +1,26 @@
+services:
+  hplip:
+    build:
+      context: .
+      args:
+        HP_PRINTER_GID: ${HP_PRINTER_GID:?Run ./scripts/setup-host.sh first}
+    image: local/hplip-p1102:3.22.10
+    restart: unless-stopped
+    environment:
+      PRINTER_NAME: HP_LaserJet_Professional_P1102
+      PRINTER_URI: 'hp:/usb/HP_LaserJet_Professional_P1102?serial=000000000Q8D61SNPR1a'
+      PRINTER_MODEL: 'drv:///hpcups.drv/hp-laserjet_professional_p1102.ppd'
+    ports:
+      - '127.0.0.1:8631:631'
+    volumes:
+      - cups-config:/etc/cups
+      - cups-spool:/var/spool/cups
+      - /dev/bus/usb:/dev/bus/usb
+    device_cgroup_rules:
+      - 'c 189:* rw'
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  cups-config:
+  cups-spool:
