@@ -49,6 +49,46 @@ class CLITests(unittest.TestCase):
             self.app.host_run(["lpstat", "-r"])
         self.assertEqual(root.call_args.args[0], ["lpstat", "-h", "/run/cups/cups.sock", "-r"])
 
+    def test_stopped_cups_with_zero_exit_code_is_started_and_awaited(self):
+        stopped = subprocess.CompletedProcess(["lpstat", "-r"], 0, "scheduler is not running\n", "")
+        ready = subprocess.CompletedProcess(["lpstat", "-r"], 0, "scheduler is running\n", "")
+        loaded = subprocess.CompletedProcess(["systemctl"], 0, "loaded\n", "")
+        with patch.object(printer.shutil, "which", side_effect=lambda command: command), \
+                patch.object(printer.Path, "is_dir", return_value=True), \
+                patch.object(self.app, "host_run", side_effect=[stopped, stopped, ready]) as probe, \
+                patch.object(self.app, "run", return_value=loaded), \
+                patch.object(self.app, "root") as root, \
+                patch.object(printer.time, "sleep"), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.app.ensure_cups()
+        root.assert_called_once_with(["systemctl", "enable", "--now", "cups.service"], stream=True)
+        self.assertEqual(probe.call_count, 3)
+        self.assertNotIn("SKIP CUPS", output.getvalue())
+        self.assertIn("CUPS хоста запущен", output.getvalue())
+
+    def test_running_cups_does_not_restart_service(self):
+        ready = subprocess.CompletedProcess(["lpstat", "-r"], 0, "scheduler is running\n", "")
+        with patch.object(printer.shutil, "which", side_effect=lambda command: command), \
+                patch.object(self.app, "host_run", return_value=ready), \
+                patch.object(self.app, "root") as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.app.ensure_cups()
+        root.assert_not_called()
+
+    def test_cups_startup_timeout_is_not_mistaken_for_success(self):
+        stopped = subprocess.CompletedProcess(["lpstat", "-r"], 0, "scheduler is not running\n", "")
+        loaded = subprocess.CompletedProcess(["systemctl"], 0, "loaded\n", "")
+        with patch.object(printer.shutil, "which", side_effect=lambda command: command), \
+                patch.object(printer.Path, "is_dir", return_value=True), \
+                patch.object(self.app, "host_run", return_value=stopped), \
+                patch.object(self.app, "run", return_value=loaded), \
+                patch.object(self.app, "root"), \
+                patch.object(printer.time, "monotonic", side_effect=[10, 31]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(printer.Failure) as raised:
+                self.app.ensure_cups()
+        self.assertIn("не стал доступен", str(raised.exception))
+
     def test_lock_conflict_does_not_run_deploy(self):
         with patch.object(sys, "argv", ["printer.py", "deploy"]), \
                 patch.object(printer.fcntl, "flock", side_effect=BlockingIOError), \

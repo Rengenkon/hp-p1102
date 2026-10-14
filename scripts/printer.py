@@ -25,7 +25,7 @@ if sys.version_info < (3, 11):
     sys.exit("ERROR: требуется Python 3.11 или новее.")
 
 import tomllib
-from runtime import atomic_write, ipp_uri, load_config, reconcile_queue
+from runtime import atomic_write, ipp_uri, load_config, reconcile_queue, scheduler_running
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / ".state"
@@ -68,7 +68,7 @@ class App:
         self.stage = title
         self.say(f"\n[{number}/7] {title}")
 
-    def run(self, args, check=True, stream=False, timeout=60, env=None):
+    def run(self, args, check=True, stream=False, timeout=60, env=None, preserve_terminal=False):
         args = [str(a) for a in args]
         command = shlex.join(args)
         self.log.write(f"$ {command}\n")
@@ -79,7 +79,7 @@ class App:
                 output = []
                 process = subprocess.Popen(args, cwd=ROOT, env=env or self.env,
                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           start_new_session=True)
+                                           start_new_session=not preserve_terminal)
                 deadline = time.monotonic() + timeout
                 selector = selectors.DefaultSelector()
                 selector.register(process.stdout, selectors.EVENT_READ)
@@ -99,10 +99,24 @@ class App:
                     result = subprocess.CompletedProcess(args, process.wait(timeout=max(1, deadline-time.monotonic())), "".join(output), "")
                 finally:
                     selector.close()
-                    process.stdout.close()
-                    if process.poll() is None:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
+                    try:
+                        if process.poll() is None:
+                            try:
+                                if preserve_terminal:
+                                    # sudo shares the terminal's process group.
+                                    # Signal only sudo; it forwards TERM to its command.
+                                    process.terminate()
+                                    try:
+                                        process.wait(timeout=5)
+                                    except subprocess.TimeoutExpired:
+                                        process.kill()
+                                else:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            process.wait()
+                    finally:
+                        process.stdout.close()
             else:
                 result = subprocess.run(args, cwd=ROOT, env=env or self.env, text=True,
                                         capture_output=True, timeout=timeout)
@@ -126,11 +140,10 @@ class App:
         if prefix and not shutil.which("sudo"):
             raise Failure("Для настройки хоста нужны права root, но sudo отсутствует.",
                           "Установите sudo или запустите команду от root с доступом к тому же Docker daemon.")
-        if prefix and kwargs.get("stream"):
-            # Authenticate with the caller's controlling terminal before starting
-            # a separate process group for streamed commands and their timeouts.
-            self.run(["sudo", "-v"], timeout=120)
-            prefix += ["-n"]
+        if prefix:
+            # Keep sudo in the caller's session so terminal-scoped credentials
+            # remain valid and it can prompt again when authentication expires.
+            kwargs["preserve_terminal"] = True
         return self.run(prefix + list(args), **kwargs)
 
     def host_run(self, args, check=True):
@@ -335,7 +348,7 @@ class App:
             if not self.config["host"]["install_cups"]:
                 raise Failure("На хосте отсутствуют инструменты CUPS.", "Установите CUPS/cups-client или включите host.install_cups в printer.toml.")
             self.install_cups()
-        if self.host_run(["lpstat", "-r"], check=False).returncode == 0:
+        if scheduler_running(self.host_run(["lpstat", "-r"], check=False)):
             self.say("  SKIP CUPS хоста уже работает")
             return
         self.say("  CHANGE Запуск CUPS хоста; требуется sudo")
@@ -361,10 +374,11 @@ class App:
         else:
             raise Failure("Не найден адаптер запуска CUPS для системы инициализации хоста.", "Запустите CUPS средствами своей системы и повторите deploy.")
         deadline = time.monotonic() + 20
-        while self.host_run(["lpstat", "-r"], check=False).returncode:
+        while not scheduler_running(self.host_run(["lpstat", "-r"], check=False)):
             if time.monotonic() > deadline:
                 raise Failure("CUPS хоста не стал доступен за 20 секунд.", "Проверьте журнал службы CUPS и повторите deploy.")
             time.sleep(1)
+        self.say("  OK   CUPS хоста запущен и отвечает")
 
     def host_queue(self):
         self.say("  Настройка очереди хоста при необходимости использует sudo.")
@@ -400,6 +414,8 @@ class App:
         self.completed.append(self.stage)
         self.step(7, "Итоговая проверка")
         self.compose(["exec", "-T", "hplip", "python3", "/usr/local/bin/entrypoint.py", "--check"])
+        nodes = [str(node) for _, node in self.devices()]
+        self.compose(["exec", "-T", "hplip", "python3", "/usr/local/bin/entrypoint.py", "--usb-check", *nodes], stream=True)
         self.host_run(["lpstat", "-p", self.config["host"]["queue"]])
         self.say(f"  OK   Развертывание завершено. IPP: {ipp_uri(self.config)}")
         if not self.devices():
@@ -423,6 +439,8 @@ class App:
         checks = [(["ps"], "Контейнер"), (["exec", "-T", "hplip", "lpstat", "-t"], "CUPS контейнера")]
         if doctor:
             checks += [(["exec", "-T", "hplip", "id", "lp"], "Группы lp"),
+                       (["exec", "-T", "hplip", "python3", "/usr/local/bin/entrypoint.py", "--usb-check",
+                         *[str(node) for _, node in self.devices()]], "Реальные права процессов CUPS и доступ к USB"),
                        (["exec", "-T", "hplip", "cat", "/var/lib/hp/hplip.state"], "HP-плагин"),
                        (["logs", "--tail=80", "hplip"], "Журнал контейнера")]
         for args, title in checks:

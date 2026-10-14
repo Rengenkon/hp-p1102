@@ -10,6 +10,22 @@ from pathlib import Path
 from urllib.parse import quote
 
 
+def scheduler_running(result):
+    # lpstat -r can return 0 even when cupsd is stopped. All callers use LC_ALL=C.
+    return result.returncode == 0 and result.stdout.strip() == "scheduler is running"
+
+
+def cups_files_config(template, group):
+    # CUPS sets its workers' primary group and clears supplementary groups.
+    # Membership in /etc/group alone does not grant the backend USB access.
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", group):
+        raise ValueError(f"Недопустимая группа CUPS: {group!r}")
+    pattern = r"(?m)^[ \t]*#?Group[ \t]+[^\n]+$"
+    if re.search(pattern, template):
+        return re.sub(pattern, f"Group {group}", template)
+    return template.rstrip() + f"\nGroup {group}\n"
+
+
 def load_config(path):
     with Path(path).open("rb") as stream:
         config = tomllib.load(stream)

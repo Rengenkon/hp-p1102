@@ -1,4 +1,6 @@
-"""Optional Docker integration check: no USB access, print jobs, or host changes.
+"""Optional Docker integration check: no USB access or host changes.
+
+Includes a job to an isolated fake backend to verify actual CUPS credentials.
 
 Usage: python3 tests/smoke_container.py local/hplip-p1102:<tag>
 """
@@ -46,12 +48,55 @@ def main(image):
                 raise RuntimeError("CUPS startup timeout\n" + run("docker", "logs", server))
             time.sleep(0.5)
         print("OK: container starts and queue is ready")
+        name = "HP_LaserJet_Professional_P1102"
+        ppd = f"/etc/cups/ppd/{name}.ppd"
+        # Simulate persistent volumes created with the old CUPS primary group.
+        run("docker", "exec", server, "chgrp", "-R", "7", "/etc/cups/ppd", "/var/spool/cups")
+        run("docker", "restart", server)
+        deadline = time.monotonic() + 30
+        while True:
+            check = subprocess.run(["docker", "exec", server, "python3", "/usr/local/bin/entrypoint.py", "--check"], capture_output=True)
+            if check.returncode == 0:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError("CUPS migration startup timeout\n" + run("docker", "logs", server))
+            time.sleep(0.25)
+        assert run("docker", "exec", server, "stat", "-c", "%g", ppd) == "987"
+        assert run("docker", "exec", server, "stat", "-c", "%g", "/var/spool/cups/tmp") == "987"
+        print("OK: old PPD/spool group ownership repaired on restart")
+        backend = '''#!/usr/bin/python3
+import os,json,sys
+from pathlib import Path
+if len(sys.argv) == 1:
+    print('direct credentials "Unknown" "Credential probe"')
+else:
+    Path("/tmp/backend-credentials.json").write_text(json.dumps({"uid":os.getuid(), "gid":os.getgid(), "groups":os.getgroups()}))
+'''
+        install_probe = (
+            "from pathlib import Path; import os; "
+            f"p=Path('/usr/lib/cups/backend/credentials'); p.write_text({backend!r}); p.chmod(0o755); "
+            "p=Path('/tmp/mock-usb'); p.touch(); os.chown(p,0,987); p.chmod(0o660)")
+        run("docker", "exec", server, "python3", "-c", install_probe)
+        run("docker", "exec", server, "python3", "/usr/local/bin/entrypoint.py", "--usb-check", "/tmp/mock-usb")
+        run("docker", "exec", server, "lpadmin", "-p", "credential_probe", "-E", "-v", "credentials:/probe", "-m", "raw")
+        run("docker", "exec", server, "lp", "-d", "credential_probe", "/etc/hosts")
+        deadline = time.monotonic() + 20
+        while True:
+            exists = subprocess.run(["docker", "exec", server, "test", "-f", "/tmp/backend-credentials.json"], capture_output=True)
+            if exists.returncode == 0:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError("Credential probe did not run\n" + run("docker", "logs", server))
+            time.sleep(0.25)
+        credentials = json.loads(run("docker", "exec", server, "cat", "/tmp/backend-credentials.json"))
+        assert credentials["uid"] != 0 and credentials["gid"] == 987, credentials
+        assert credentials["groups"] == [987], credentials
+        print("OK: actual CUPS backend uses the USB primary group, with no reliance on supplementary groups")
         before = run("docker", "exec", server, "stat", "-c", "%Y", "/etc/cups/.managed-printer.json")
         repeated = run("docker", "exec", server, "python3", "/usr/local/bin/entrypoint.py", "--apply")
         assert "SKIP" in repeated, repeated
         assert before == run("docker", "exec", server, "stat", "-c", "%Y", "/etc/cups/.managed-printer.json")
         print("OK: repeated apply leaves queue and state intact")
-        name = "HP_LaserJet_Professional_P1102"
         run("docker", "exec", server, "lpadmin", "-p", name, "-v", "hp:/usb/wrong", "-o", "PageSize=Letter")
         run("docker", "exec", server, "cupsdisable", name)
         run("docker", "exec", server, "python3", "/usr/local/bin/entrypoint.py", "--apply")
@@ -75,14 +120,18 @@ def main(image):
 import os,sys,time,subprocess
 from pathlib import Path
 sys.path.insert(0,"/usr/local/lib/printer")
-from runtime import local_run,reconcile_queue
+from runtime import local_run,reconcile_queue,scheduler_running
 os.environ["LC_ALL"]="C"
 Path("/run/cups").mkdir(parents=True,exist_ok=True)
+stopped=local_run(["lpstat","-r"],check=False)
+assert not scheduler_running(stopped), stopped.stdout + stopped.stderr
 cups=subprocess.Popen(["cupsd","-f"])
 try:
     for _ in range(40):
-        if local_run(["lpstat","-r"],check=False).returncode == 0: break
+        if scheduler_running(local_run(["lpstat","-r"],check=False)): break
         time.sleep(.25)
+    else:
+        raise AssertionError("Client CUPS scheduler did not start")
     probe=local_run(["lpstat","-h","printer-server:631","-p","HP_LaserJet_Professional_P1102"],check=False)
     assert probe.returncode == 0, probe.stdout + probe.stderr
     for _ in range(2):
