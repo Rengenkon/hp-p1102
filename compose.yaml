@@ -1,6 +1,7 @@
 name: hp-docker
 services:
   hplip:
+    container_name: hp-p1102-${PRINTER_MODE:-local}
     image: ${PRINTER_IMAGE:?Run python3 scripts/printer.py deploy}
     restart: unless-stopped
     environment:
