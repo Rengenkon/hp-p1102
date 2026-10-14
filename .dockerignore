@@ -2,7 +2,11 @@
 .state
 .venv
 __pycache__
+**/__pycache__
+**/*.py[cod]
 tests
+docs
+README.md
 plugins/*.asc
 *.log
 .env

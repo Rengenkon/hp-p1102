@@ -11,15 +11,9 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from docker_helpers import cleanup, run, wait_ready
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def run(*args, check=True):
-    result = subprocess.run([str(a) for a in args], text=True, capture_output=True, timeout=120)
-    if check and result.returncode:
-        raise RuntimeError(f"{args}\n{result.stdout}\n{result.stderr}")
-    return result.stdout.strip()
 
 
 def main(image):
@@ -36,31 +30,14 @@ def main(image):
             "--network-alias", "printer-server", "--security-opt", "no-new-privileges:true",
             "-e", "HP_PRINTER_GID=987",
             "-v", f"{runtime.name}:/etc/printer:ro", image)
-        deadline = time.monotonic() + 45
-        while True:
-            state = json.loads(run("docker", "inspect", server))[0]["State"]
-            if not state["Running"]:
-                raise RuntimeError(run("docker", "logs", server))
-            check = subprocess.run(["docker", "exec", server, "python3", "/usr/local/bin/entrypoint.py", "--check"], capture_output=True)
-            if check.returncode == 0:
-                break
-            if time.monotonic() > deadline:
-                raise RuntimeError("CUPS startup timeout\n" + run("docker", "logs", server))
-            time.sleep(0.5)
+        wait_ready(server)
         print("OK: container starts and queue is ready")
         name = "HP_LaserJet_Professional_P1102"
         ppd = f"/etc/cups/ppd/{name}.ppd"
         # Simulate persistent volumes created with the old CUPS primary group.
         run("docker", "exec", server, "chgrp", "-R", "7", "/etc/cups/ppd", "/var/spool/cups")
         run("docker", "restart", server)
-        deadline = time.monotonic() + 30
-        while True:
-            check = subprocess.run(["docker", "exec", server, "python3", "/usr/local/bin/entrypoint.py", "--check"], capture_output=True)
-            if check.returncode == 0:
-                break
-            if time.monotonic() > deadline:
-                raise RuntimeError("CUPS migration startup timeout\n" + run("docker", "logs", server))
-            time.sleep(0.25)
+        wait_ready(server, timeout=30)
         assert run("docker", "exec", server, "stat", "-c", "%g", ppd) == "987"
         assert run("docker", "exec", server, "stat", "-c", "%g", "/var/spool/cups/tmp") == "987"
         print("OK: old PPD/spool group ownership repaired on restart")
@@ -149,9 +126,7 @@ finally:
         assert state["ExitCode"] == 0, state
         print("OK: SIGTERM stops daemons cleanly")
     finally:
-        run("docker", "rm", "-f", client, server, check=False)
-        run("docker", "network", "rm", network, check=False)
-        runtime.cleanup()
+        cleanup(client, server, network, runtime)
 
 
 if __name__ == "__main__":

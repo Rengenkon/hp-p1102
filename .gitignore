@@ -5,3 +5,4 @@ plugins/*.asc
 .state/
 .venv/
 __pycache__/
+*.py[cod]

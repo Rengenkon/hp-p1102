@@ -4,24 +4,17 @@ Usage: python3 tests/smoke_server.py local/hplip-p1102:server-<hash>
 """
 import json
 import struct
-import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
 import uuid
 from pathlib import Path
+from docker_helpers import cleanup, container_logs, run, wait_ready
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from ipp import Attribute, attributes, decode_prefix, encode_prefix, printer_attributes_request
-
-
-def run(*args, check=True):
-    result = subprocess.run([str(a) for a in args], text=True, capture_output=True, timeout=120)
-    if check and result.returncode:
-        raise RuntimeError(f"{args}\n{result.stdout}\n{result.stderr}")
-    return result.stdout.strip()
+from ipp import Attribute, attributes, decode_prefix, encode_prefix
 
 
 def main(image):
@@ -35,17 +28,7 @@ def main(image):
         run("docker", "run", "-d", "--name", server, "--network", network, "--network-alias", "printer-server",
             "--security-opt", "no-new-privileges:true", "-e", "HP_PRINTER_GID=987",
             "-v", f"{runtime.name}:/etc/printer:ro", "-p", "127.0.0.1::8631", image)
-        deadline = time.monotonic() + 45
-        while True:
-            state = json.loads(run("docker", "inspect", server))[0]["State"]
-            if not state["Running"]:
-                raise RuntimeError(run("docker", "logs", server))
-            checked = subprocess.run(["docker", "exec", server, "python3", "/usr/local/bin/entrypoint.py", "--check"], capture_output=True)
-            if checked.returncode == 0:
-                break
-            if time.monotonic() > deadline:
-                raise RuntimeError("Server startup timeout\n" + run("docker", "logs", server))
-            time.sleep(0.25)
+        wait_ready(server)
         binding = json.loads(run("docker", "inspect", server))[0]["NetworkSettings"]["Ports"]["8631/tcp"][0]
         base = f"http://127.0.0.1:{binding['HostPort']}"
         public = base.replace("http://", "ipp://") + "/"
@@ -158,13 +141,10 @@ finally:
         assert json.loads(run("docker", "inspect", server))[0]["State"]["ExitCode"] == 0
         print("OK: SIGTERM stops the proxy and both daemons cleanly")
     except Exception:
-        logs = subprocess.run(["docker", "logs", "--tail", "60", server], text=True, capture_output=True)
-        print(logs.stdout + logs.stderr)
+        print(container_logs(server))
         raise
     finally:
-        run("docker", "rm", "-f", client, server, check=False)
-        run("docker", "network", "rm", network, check=False)
-        runtime.cleanup()
+        cleanup(client, server, network, runtime)
 
 
 if __name__ == "__main__":
